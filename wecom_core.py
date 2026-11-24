@@ -13,6 +13,8 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
+import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -176,10 +178,12 @@ class WeComConfig:
     corp_id: str = ""
     msgaudit_secret: str = ""
     external_contact_secret: str = ""
+    contact_secret: str = ""
     sdk_lib_path: str = "./libWeWorkFinanceSdk_C.so"
     private_key_path: str = "./private_key.pem"
     seq_file: str = "./wecom_msg_seq.txt"
     output_jsonl: str = "./wecom_messages.jsonl"
+    names_cache_file: str = "./name_cache.json"
     fetch_limit: int = DEFAULT_FETCH_LIMIT
     sdk_timeout: int = DEFAULT_SDK_TIMEOUT
     proxy: str = ""
@@ -191,10 +195,12 @@ class WeComConfig:
             corp_id=os.getenv("CORP_ID", ""),
             msgaudit_secret=os.getenv("MSGAUDIT_SECRET", ""),
             external_contact_secret=os.getenv("EXTERNAL_CONTACT_SECRET", ""),
+            contact_secret=os.getenv("CONTACT_SECRET", ""),
             sdk_lib_path=os.getenv("SDK_LIB_PATH", cls.sdk_lib_path),
             private_key_path=os.getenv("PRIVATE_KEY_PATH", cls.private_key_path),
             seq_file=os.getenv("SEQ_FILE", cls.seq_file),
             output_jsonl=os.getenv("OUTPUT_JSONL", cls.output_jsonl),
+            names_cache_file=os.getenv("NAMES_CACHE_FILE", cls.names_cache_file),
             fetch_limit=int(os.getenv("FETCH_LIMIT", str(DEFAULT_FETCH_LIMIT))),
             sdk_timeout=int(os.getenv("SDK_TIMEOUT", str(DEFAULT_SDK_TIMEOUT))),
             proxy=os.getenv("PROXY", ""),
@@ -270,6 +276,15 @@ def rsa_decrypt_encrypt_random_key(
 # ----------------------------------------------------------------------------
 # 官方 SDK 封装（ctypes）
 # ----------------------------------------------------------------------------
+class Slice_t(ctypes.Structure):
+    """对应官方 SDK 的 Slice_t，布局为 { char* buf; int len; }。"""
+
+    _fields_ = [
+        ("buf", c_void_p),
+        ("len", c_int),
+    ]
+
+
 class WeWorkFinanceSDK:
     """企业微信官方 libWeWorkFinanceSdk_C 的轻量封装。"""
 
@@ -319,7 +334,7 @@ class WeWorkFinanceSDK:
         lib.DecryptData.restype = c_int
 
         lib.GetMediaData.argtypes = [
-            c_char_p, c_char_p, c_char_p, c_char_p, c_int, c_void_p,
+            Slice_t, c_char_p, c_char_p, c_char_p, c_int, c_void_p,
         ]
         lib.GetMediaData.restype = c_int
 
@@ -386,17 +401,21 @@ class WeWorkFinanceSDK:
         proxy: str = "",
         passwd: str = "",
     ) -> bytes:
-        """通过 sdkfileid 拉取媒体二进制。"""
+        """通过 sdkfileid 拉取媒体二进制。
+
+        官方签名：GetMediaData(Slice_t indexbuf, sdkfileid, proxy, passwd, timeout, Slice_t* out)。
+        首次拉取时 indexbuf 传空切片（buf=NULL, len=0）。
+        """
         index_buf = self.lib.NewSlice()
         if not index_buf:
             raise RuntimeError("NewSlice 失败")
 
         try:
             ret = self.lib.GetMediaData(
-                b"",
+                Slice_t(),
+                sdkfileid.encode("utf-8"),
                 proxy.encode("utf-8") if proxy else b"",
                 passwd.encode("utf-8") if passwd else b"",
-                sdkfileid.encode("utf-8"),
                 c_int(timeout),
                 index_buf,
             )
@@ -451,6 +470,14 @@ class WeComAPIClient:
         )
         return resp.json()
 
+    def get(self, path: str, params: dict | None = None) -> dict:
+        resp = self.session.get(
+            f"{WECOM_API_BASE}{path}",
+            params={"access_token": self.get_access_token(), **(params or {})},
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+        return resp.json()
+
 
 # ----------------------------------------------------------------------------
 # 本地消息文件辅助
@@ -479,6 +506,48 @@ def count_jsonl_lines(path: str) -> int:
         return 0
     with open(path_obj, "r", encoding="utf-8") as f:
         return sum(1 for line in f if line.strip())
+
+
+def load_msgids(path: str) -> set[str]:
+    """从本地 JSONL 中加载已存在的 msgid 集合，用于写前去重。"""
+    msgids: set[str] = set()
+    path_obj = Path(path)
+    if not path_obj.exists():
+        return msgids
+    with open(path_obj, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msgid = row.get("msgid")
+            if msgid:
+                msgids.add(msgid)
+    return msgids
+
+
+def dedupe_by_msgid(
+    rows: list[dict], existing: set[str] | None = None
+) -> tuple[list[dict], int]:
+    """按 msgid 去重：跳过已存在的与批次内重复的。
+
+    msgid 缺失的记录不做去重判断，原样保留。
+    返回 (去重后的列表, 重复条数)。
+    """
+    seen = set(existing or ())
+    kept: list[dict] = []
+    duplicates = 0
+    for row in rows:
+        msgid = row.get("msgid")
+        if msgid and msgid in seen:
+            duplicates += 1
+            continue
+        if msgid:
+            seen.add(msgid)
+        kept.append(row)
+    return kept, duplicates
 
 
 def extract_sdkfileids(message: dict) -> list[str]:
@@ -529,6 +598,7 @@ class PullResult:
     end_seq: int
     success_count: int
     fail_count: int
+    duplicate_count: int = 0
     messages: list[dict] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
 
@@ -582,6 +652,7 @@ def pull_messages(
         max_seq = current_seq
         success_count = 0
         fail_count = 0
+        duplicate_count = 0
         messages: list[dict] = []
         errors: list[dict] = []
 
@@ -596,8 +667,6 @@ def pull_messages(
                 )
                 success_count += 1
                 messages.append(decrypted)
-                if save_to_file and config.output_jsonl:
-                    append_jsonl(config.output_jsonl, decrypted)
             except Exception as e:
                 fail_count += 1
                 errors.append(
@@ -608,12 +677,30 @@ def pull_messages(
                     }
                 )
 
+        # msgid 去重：跳过文件中已有的与批次内重复的，再去落盘
+        if messages:
+            existing = (
+                load_msgids(config.output_jsonl)
+                if save_to_file and config.output_jsonl
+                else set()
+            )
+            messages, duplicate_count = dedupe_by_msgid(messages, existing)
+            if save_to_file and config.output_jsonl:
+                for row in messages:
+                    append_jsonl(config.output_jsonl, row)
+                # 同步写入 sqlite 会话索引（msgid 幂等，失败不影响主数据）
+                try:
+                    index_ingest_rows(config.output_jsonl, messages)
+                except sqlite3.Error as e:
+                    errors.append({"seq": None, "msgid": None, "error": f"会话索引写入失败（可从 JSONL 重建）: {e}"})
+
         save_seq(config.seq_file, max_seq)
         return PullResult(
             start_seq=current_seq,
             end_seq=max_seq,
             success_count=success_count,
             fail_count=fail_count,
+            duplicate_count=duplicate_count,
             messages=messages,
             errors=errors,
         )
@@ -640,6 +727,16 @@ def _is_image_data(data: bytes, sdkfileid: str) -> bool:
     if guessed and guessed.startswith("image/"):
         return True
     return any(sdkfileid.endswith(ext) for ext in _IMAGE_EXTS)
+
+
+def save_image_locally(
+    config: WeComConfig, data: bytes, mime: str, ext: str, file_hash: str
+) -> Path:
+    """R2 未配置时把图片保存到 data/media/，返回文件路径。"""
+    out_path = Path(config.output_jsonl).parent / "media" / f"img_{file_hash}{ext}"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(data)
+    return out_path
 
 
 def download_media(
@@ -681,15 +778,28 @@ def download_media(
         if _is_image_data(data, sdkfileid):
             mime, ext = _detect_image_mime(data)
             file_hash = hashlib.sha256(data).hexdigest()[:16]
-            object_key = f"{R2_IMAGE_KEY_PREFIX}{file_hash}{ext}"
-            url = upload_to_r2_and_presign(data, key=object_key, content_type=mime)
+            r2 = R2Config.from_env()
+            if r2.is_configured():
+                object_key = f"{R2_IMAGE_KEY_PREFIX}{file_hash}{ext}"
+                url = upload_to_r2_and_presign(data, key=object_key, content_type=mime)
+                lines.append(f"类型: {mime}")
+                lines.append(
+                    f"访问链接（R2 预签名，有效期 {R2_PRESIGN_EXPIRES // 3600} 小时）: {url}"
+                )
+                lines.append(
+                    "用法说明: 将上述链接在浏览器中打开即可查看图片；"
+                    "链接过期后需重新调用本工具获取新链接"
+                )
+                return "\n".join(lines)
+
+            # R2 未配置：降级保存到本地 data/media/，可通过 /media/<文件名> 访问
+            out_path = save_image_locally(config, data, mime, ext, file_hash)
             lines.append(f"类型: {mime}")
+            lines.append(f"已保存到本地: {out_path}")
+            lines.append("访问方式: GET /media/img_<hash><扩展名>（如 http://127.0.0.1:8331/media/）")
             lines.append(
-                f"访问链接（R2 预签名，有效期 {R2_PRESIGN_EXPIRES // 3600} 小时）: {url}"
-            )
-            lines.append(
-                "用法说明: 将上述链接在浏览器中打开即可查看图片；"
-                "链接过期后需重新调用本工具获取新链接"
+                "说明: R2 未配置，图片降级保存到本地；在 .env 配置 "
+                "R2_ENDPOINT/R2_BUCKET/R2_S3_ID/R2_S3_KEY 后重建容器可改为返回在线链接"
             )
             return "\n".join(lines)
 
@@ -729,6 +839,43 @@ def load_roomids_from_messages(path: str) -> set[str]:
     return roomids
 
 
+def message_search_text(msg: dict) -> str:
+    """提取消息的可搜索文本（内容字段白名单，不含 roomid/seq 等结构字段）。"""
+    parts: list[str] = []
+
+    def _add(value: Any) -> None:
+        if isinstance(value, str) and value:
+            parts.append(value)
+        elif isinstance(value, dict):
+            for v in value.values():
+                _add(v)
+        elif isinstance(value, list):
+            for v in value:
+                _add(v)
+
+    t = msg.get("msgtype")
+    if t == "text":
+        _add(msg.get("text", {}).get("content"))
+    elif t == "mixed":
+        _add(msg.get("mixed", {}).get("item"))
+    elif t == "link":
+        link = msg.get("link", {})
+        _add(link.get("title"))
+        _add(link.get("description"))
+    elif t == "file":
+        _add(msg.get("file", {}).get("filename"))
+    elif t == "location":
+        _add(msg.get("location", {}).get("address"))
+    elif t == "sphfeed":
+        sph = msg.get("sphfeed", {})
+        _add(sph.get("sph_name"))
+        _add(sph.get("feed_desc"))
+    else:
+        # 其余类型：尝试常见 content 字段，找不到就没有可搜索文本
+        _add(msg.get("content"))
+    return " ".join(parts)
+
+
 def query_messages(
     path: str,
     *,
@@ -757,10 +904,8 @@ def query_messages(
                 continue
             if msgtype and msg.get("msgtype") != msgtype:
                 continue
-            if keyword:
-                text = json.dumps(row, ensure_ascii=False)
-                if keyword not in text:
-                    continue
+            if keyword and keyword not in message_search_text(msg):
+                continue
 
             matched.append(row)
 
@@ -771,6 +916,239 @@ def query_messages(
         "limit": limit,
         "messages": matched[offset : offset + limit],
     }
+
+
+# ----------------------------------------------------------------------------
+# 业务：会话分桶（按群/按人归类）
+# ----------------------------------------------------------------------------
+def session_key(message: dict) -> str | None:
+    """推导一条消息所属的会话键。
+
+    - 群聊：roomid 非空 -> "group:<roomid>"
+    - 单聊：roomid 为空 -> "dm:<对端对>"（无序对，双向消息落同一桶，无需知道"我"是谁）
+    - 系统类消息（无 roomid、无 tolist）-> "dm:<from>"
+    """
+    roomid = message.get("roomid")
+    if roomid:
+        return f"group:{roomid}"
+
+    from_user = message.get("from") or ""
+    tolist = [u for u in (message.get("tolist") or []) if u]
+    if from_user and tolist:
+        pair = sorted({from_user, tolist[0]})
+        return "dm:" + "+".join(pair)
+    if from_user:
+        return f"dm:{from_user}"
+    return None
+
+
+def split_sessions(rows: list[dict]) -> dict[str, list[dict]]:
+    """把解密后的消息行按会话分桶，桶内按 seq 升序。
+
+    无法推导会话键的消息落入 "unknown" 桶，不丢弃。
+    """
+    buckets: dict[str, list[dict]] = {}
+    for row in rows:
+        key = session_key(row.get("message", {})) or "unknown"
+        buckets.setdefault(key, []).append(row)
+    for key in buckets:
+        buckets[key].sort(key=lambda r: (r.get("seq") or 0))
+    return buckets
+
+
+def _safe_filename(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", key)
+
+
+# ----------------------------------------------------------------------------
+# 业务：会话索引（sqlite 增量，可从 JSONL 完整重建）
+# ----------------------------------------------------------------------------
+def _session_db_path(output_jsonl: str) -> Path:
+    """sqlite 索引文件与主 JSONL 同目录。"""
+    return Path(output_jsonl).parent / "sessions_index.db"
+
+
+def _open_session_db(output_jsonl: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(_session_db_path(output_jsonl))
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS messages (
+               msgid TEXT PRIMARY KEY,
+               seq INTEGER NOT NULL,
+               session_key TEXT NOT NULL,
+               msgtime INTEGER,
+               row TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_key ON messages(session_key, seq)"
+    )
+    conn.commit()
+    return conn
+
+
+def index_ingest_rows(output_jsonl: str, rows: list[dict]) -> int:
+    """把解密消息行增量写入索引。msgid 幂等（重复跳过），返回新插入条数。
+
+    缺 msgid 的记录无法幂等去重，不入索引（主 JSONL 仍保留）。
+    """
+    if not rows:
+        return 0
+    conn = _open_session_db(output_jsonl)
+    try:
+        inserted = 0
+        for row in rows:
+            msg = row.get("message", {})
+            msgid = row.get("msgid")
+            if not msgid:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?)",
+                (
+                    msgid,
+                    int(row.get("seq") or 0),
+                    session_key(msg) or "unknown",
+                    int(msg.get("msgtime") or 0),
+                    json.dumps(row, ensure_ascii=False),
+                ),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+
+def index_ingest_jsonl(output_jsonl: str) -> int:
+    """从主 JSONL 全量导入索引（幂等）。"""
+    path_obj = Path(output_jsonl)
+    if not path_obj.exists():
+        return 0
+    rows: list[dict] = []
+    with open(path_obj, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return index_ingest_rows(output_jsonl, rows)
+
+
+def _ensure_index(output_jsonl: str) -> None:
+    """懒重建：索引为空而主 JSONL 有数据时，全量导入一次。"""
+    conn = _open_session_db(output_jsonl)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+    if count == 0:
+        index_ingest_jsonl(output_jsonl)
+
+
+def all_message_userids(output_jsonl: str) -> set[str]:
+    """扫描索引中全部消息，收集出现过的 userid（from + tolist）。"""
+    path_obj = Path(output_jsonl)
+    if not path_obj.exists():
+        return set()
+    _ensure_index(output_jsonl)
+    conn = _open_session_db(output_jsonl)
+    try:
+        ids: set[str] = set()
+        for (r,) in conn.execute("SELECT row FROM messages"):
+            msg = json.loads(r).get("message", {})
+            if msg.get("from"):
+                ids.add(msg["from"])
+            for u in msg.get("tolist") or []:
+                if u:
+                    ids.add(u)
+        return ids
+    finally:
+        conn.close()
+
+
+def export_sessions(path: str, out_dir: str, *, write_files: bool = True) -> dict[str, Any]:
+    """读取本地消息（走 sqlite 索引），按会话统计；可选写出 <out_dir>/<key>.jsonl。
+
+    返回各会话的统计（条数、时间范围、文件名），按条数降序。
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        return {"total": 0, "sessions": []}
+
+    _ensure_index(path)
+    conn = _open_session_db(path)
+    try:
+        grouped = conn.execute(
+            """SELECT session_key, COUNT(*), MIN(msgtime), MAX(msgtime)
+               FROM messages GROUP BY session_key ORDER BY COUNT(*) DESC"""
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    if write_files:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    sessions: list[dict[str, Any]] = []
+    for key, count, lo, hi in grouped:
+        filename = f"{_safe_filename(key)}.jsonl"
+        if write_files:
+            offset = 0
+            with open(Path(out_dir) / filename, "w", encoding="utf-8") as f:
+                while True:
+                    page = get_session_messages(
+                        path, key, limit=500, offset=offset
+                    )
+                    if not page["messages"]:
+                        break
+                    for r in page["messages"]:
+                        f.write(json.dumps(r, ensure_ascii=False))
+                        f.write("\n")
+                    offset += len(page["messages"])
+                    if offset >= page["total"]:
+                        break
+        sessions.append(
+            {
+                "session_key": key,
+                "count": count,
+                "first_msgtime": lo if lo else None,
+                "last_msgtime": hi if hi else None,
+                "file": filename if write_files else None,
+            }
+        )
+
+    return {"total": total, "sessions": sessions}
+
+
+def get_session_messages(
+    path: str,
+    session_key: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """取单个会话的消息行（按 seq 升序），支持分页。数据来自 sqlite 索引。"""
+    path_obj = Path(path)
+    if not path_obj.exists():
+        return {"total": 0, "messages": [], "offset": offset, "limit": limit}
+
+    _ensure_index(path)
+    conn = _open_session_db(path)
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_key = ?", (session_key,)
+        ).fetchone()[0]
+        cur = conn.execute(
+            "SELECT row FROM messages WHERE session_key = ? ORDER BY seq, msgid LIMIT ? OFFSET ?",
+            (session_key, limit, offset),
+        )
+        messages = [json.loads(r[0]) for r in cur.fetchall()]
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "messages": messages,
+        }
+    finally:
+        conn.close()
 
 
 # ----------------------------------------------------------------------------
@@ -828,3 +1206,179 @@ def list_external_groups(config: WeComConfig, limit: int = 100) -> list[dict]:
             break
 
     return groups[:limit]
+
+
+# ----------------------------------------------------------------------------
+# 业务：名称解析（userid/roomid -> 姓名/群名）
+# ----------------------------------------------------------------------------
+NAME_CACHE_TTL = 24 * 3600
+
+
+class NameResolver:
+    """userid/roomid 到名称的解析器，带本地 JSON 缓存与 TTL。
+
+    缓存结构: {"users": {id: {"name": str, "ts": int}}, "groups": {...}}
+    凭据缺失或接口失败时返回 None，调用方应降级显示原始 ID，不抛异常。
+    """
+
+    def __init__(self, config: WeComConfig):
+        self.config = config
+        self.cache_file = Path(config.names_cache_file)
+        self._users: dict[str, dict] = {}
+        self._groups: dict[str, dict] = {}
+        self._dirty = False
+        self._load()
+
+    # -- 缓存 ----------------------------------------------------------------
+    def _load(self) -> None:
+        if not self.cache_file.exists():
+            return
+        try:
+            data = json.loads(self.cache_file.read_text(encoding="utf-8"))
+            self._users = data.get("users", {})
+            self._groups = data.get("groups", {})
+        except (json.JSONDecodeError, OSError):
+            self._users = {}
+            self._groups = {}
+
+    def save(self) -> None:
+        if not self._dirty:
+            return
+        self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_file.write_text(
+            json.dumps({"users": self._users, "groups": self._groups}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._dirty = False
+
+    @staticmethod
+    def _fresh(entry: dict | None) -> str | None:
+        if not entry:
+            return None
+        name = entry.get("name")
+        if not name:
+            return None
+        # 手工设置的姓名永久有效，不参与 TTL
+        if entry.get("manual"):
+            return name
+        if time.time() - entry.get("ts", 0) > NAME_CACHE_TTL:
+            return None
+        return name
+
+    def set_user(self, userid: str, name: str) -> None:
+        """手工设置/清除 userid 的姓名（manual 标记，不受 TTL 影响）。
+
+        name 为空字符串时删除该映射。
+        """
+        if not userid:
+            return
+        if name:
+            self._users[userid] = {"name": name, "ts": int(time.time()), "manual": True}
+        else:
+            self._users.pop(userid, None)
+        self._dirty = True
+        self.save()
+
+    def all_users(self) -> dict[str, str]:
+        """当前全部有效映射 {userid: name}（含手工与接口获取）。"""
+        return {uid: name for uid, name in ((u, self._fresh(e)) for u, e in self._users.items()) if name}
+
+    # -- 查询 ----------------------------------------------------------------
+    def user_name(self, userid: str) -> str | None:
+        """单个 userid -> 姓名；缓存过期时逐个拉取（需 CONTACT_SECRET）。"""
+        cached = self._fresh(self._users.get(userid))
+        if cached:
+            return cached
+        if not self.config.contact_secret or not self.config.corp_id:
+            return None
+        try:
+            client = WeComAPIClient(self.config.corp_id, self.config.contact_secret)
+            data = client.get("/cgi-bin/user/get", {"userid": userid})
+        except Exception:
+            return None
+        if data.get("errcode") != 0:
+            return None
+        name = data.get("name")
+        if not name:
+            return None
+        self._users[userid] = {"name": name, "ts": int(time.time())}
+        self._dirty = True
+        self.save()
+        return name
+
+    def group_name(self, roomid: str) -> str | None:
+        """roomid -> 群名；先试内部群（会话存档 Secret），再试外部客户群。"""
+        cached = self._fresh(self._groups.get(roomid))
+        if cached:
+            return cached
+        if not self.config.corp_id:
+            return None
+
+        if self.config.msgaudit_secret:
+            try:
+                client = WeComAPIClient(self.config.corp_id, self.config.msgaudit_secret)
+                data = client.post("/cgi-bin/msgaudit/groupchat/get", {"roomid": roomid})
+                name = data.get("roomname")
+                if data.get("errcode") == 0 and name:
+                    self._groups[roomid] = {"name": name, "ts": int(time.time())}
+                    self._dirty = True
+                    self.save()
+                    return name
+            except Exception:
+                pass
+
+        if self.config.external_contact_secret:
+            try:
+                client = WeComAPIClient(self.config.corp_id, self.config.external_contact_secret)
+                data = client.post(
+                    "/cgi-bin/externalcontact/groupchat/get",
+                    {"chat_id": roomid, "need_name": 1},
+                )
+                name = (data.get("group_chat") or {}).get("name")
+                if data.get("errcode") == 0 and name:
+                    self._groups[roomid] = {"name": name, "ts": int(time.time())}
+                    self._dirty = True
+                    self.save()
+                    return name
+            except Exception:
+                pass
+
+        return None
+
+    # -- 批量刷新 ------------------------------------------------------------
+    def refresh_users(self) -> int:
+        """从通讯录全量拉取成员姓名（根部门递归），返回刷新条数。"""
+        if not self.config.contact_secret or not self.config.corp_id:
+            raise RuntimeError("未配置 CONTACT_SECRET（通讯录同步 Secret），无法刷新成员姓名")
+
+        client = WeComAPIClient(self.config.corp_id, self.config.contact_secret)
+        data = client.get(
+            "/cgi-bin/user/list",
+            {"department_id": 1, "fetch_child": 1},
+        )
+        if data.get("errcode") != 0:
+            raise RuntimeError(f"拉取通讯录失败: {data}")
+
+        now = int(time.time())
+        count = 0
+        for user in data.get("userlist", []):
+            if user.get("userid") and user.get("name"):
+                self._users[user["userid"]] = {"name": user["name"], "ts": now}
+                count += 1
+        self._dirty = True
+        self.save()
+        return count
+
+    def refresh_groups(self, roomids: list[str]) -> tuple[int, list[str]]:
+        """逐个刷新群名（内部群优先、外部客户群兜底），返回 (成功数, 失败列表)。"""
+        failed: list[str] = []
+        ok = 0
+        for roomid in roomids:
+            if self.group_name(roomid):
+                ok += 1
+            else:
+                failed.append(roomid)
+        return ok, failed
+
+    def stats(self) -> dict[str, Any]:
+        return {"users": len(self._users), "groups": len(self._groups)}

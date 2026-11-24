@@ -1,0 +1,33 @@
+services:
+  wecom-mcp:
+    build: .
+    image: wecom-msg-audit-mcp:latest
+    container_name: wecom-msg-audit-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8331"
+      SDK_LIB_PATH: /app/sdk/libWeWorkFinanceSdk_C.so
+      PRIVATE_KEY_PATH: /app/secrets/private_key.pem
+      SEQ_FILE: /app/data/wecom_msg_seq.txt
+      OUTPUT_JSONL: /app/data/wecom_messages.jsonl
+      NAMES_CACHE_FILE: /app/data/name_cache.json
+    ports:
+      - "127.0.0.1:8331:8331"
+    volumes:
+      - ./data:/app/data
+      - ./sdk:/app/sdk:ro
+      - ./secrets:/app/secrets:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import sys,urllib.request; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8331/health", timeout=3).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

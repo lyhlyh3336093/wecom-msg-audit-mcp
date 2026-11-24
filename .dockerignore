@@ -1,0 +1,29 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+
+# 敏感信息：.env 由 docker compose 的 env_file 注入，SDK 与私钥靠卷挂载
+.env
+.env.local
+.env.*.local
+private_key.pem
+*.pem
+*.key
+libWeWorkFinanceSdk_C.*
+*.so
+*.dylib
+*.dll
+sdk/
+secrets/
+
+# 运行时数据
+data/
+*.jsonl
+media_*
+downloads/
+*.log
+*.tmp
+*.pid

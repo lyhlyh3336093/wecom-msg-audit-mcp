@@ -33,6 +33,7 @@ dependencies = [
     "pycryptodome>=3.23.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
+    "wecom-aibot-sdk>=1.0.8",
 ]
 
 [project.scripts]
