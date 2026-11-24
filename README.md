@@ -202,6 +202,21 @@ Agent: 调用 wecom_pull_messages → 解密
 
 ## 开发
 
+### 群聊问答机器人与迁移
+
+- **企微内部群问答**（已上线）：会话存档 → @检测 → RAG → 智能机器人长连接回复
+- **微信群问答**（wxbridge）：`wecom_bot/wxbridge.py`，部署与验收见 [docs/deploy-wechat-bot.md](docs/deploy-wechat-bot.md)
+- **全栈迁移**（当前机器 → 新 Windows 主机）：[scripts/migrate/MIGRATION.md](scripts/migrate/MIGRATION.md)
+- **Docker 引擎看门狗**：`scripts/wddog/register-task.ps1`
+- 实施计划: [docs/plans/2026-11-24-001-feat-wechat-group-bot-migration-plan.md](docs/plans/2026-11-24-001-feat-wechat-group-bot-migration-plan.md)
+
+### 自测
+
+```bash
+uv run python -m wecom_bot.selftest          # 机器人链路 38 项
+uv run python -m wecom_bot.wxbridge_selftest # 微信渠道适配器 24 项
+```
+
 ```bash
 # 启动 HTTP 模式做本地调试
 MCP_TRANSPORT=http MCP_PORT=8331 uv run python mcp_server.py
