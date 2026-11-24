@@ -139,11 +139,12 @@ async def test_matcher() -> None:
                   bool(intents) and len(json.loads(merged[0]["msg_ids"])) == 2, str(intents))
 
             # 冷却
-            add_rule(runtime, "冷却规则", ["@智能小助手"], cooldown=3600, priority=50)
+            cooldown_rule_id = add_rule(runtime, "冷却规则", ["@智能小助手"], cooldown=3600, priority=50)
             add_message(runtime, "m5", text="@智能小助手 再问一次", msgtime=T0 + 400_000)
             clock.value = T0 + 431_000
             intents = await matcher.tick()
-            check("高优先级冷却规则触发", len(intents) == 1 and intents[0].rule_id == add_rule.__defaults__ or True)
+            check("高优先级冷却规则触发", len(intents) == 1 and intents[0].rule_id == cooldown_rule_id,
+                  f"intents={intents} 期望 rule_id={cooldown_rule_id}")
             add_message(runtime, "m6", text="@智能小助手 三连问", msgtime=T0 + 500_000)
             clock.value = T0 + 531_000
             check("冷却期内不触发", (await matcher.tick()) == [])
@@ -183,7 +184,8 @@ async def test_connectors_render() -> None:
                       body_template='{"q": "${text}"}', egress_policy="params_only",
                       timeout_seconds=5, retries=0)
     check("params_only 清空原文", build_body(conn2, {"text": "机密"}) == '{"q": ""}')
-    check("脱敏身份证", redact_text("身份证 11010119900307777X") == "身份证 110101********7777X"[:6] + redact_text("11010119900307777X")[6:] or True)
+    check("脱敏身份证", redact_text("身份证 11010119900307777X") == "身份证 110101********777X",
+          repr(redact_text("身份证 11010119900307777X")))
     check("手机号脱敏", redact_text("联系 13812345678") == "联系 138****5678")
 
 

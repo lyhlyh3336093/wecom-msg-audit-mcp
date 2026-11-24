@@ -121,22 +121,32 @@ def make_handler(runtime, ws_client, gen_req_id) -> Callable[[dict[str, Any]], A
 
 
 async def run_aibot(runtime) -> None:
-    """长连接主循环：SDK 内置心跳/重连；runtime.stop 置位后退出。"""
+    """长连接主循环：SDK 内置心跳/重连；connect 失败带退避重试；runtime.stop 置位后退出。"""
     from wecom_aibot_sdk import WSClient, generate_req_id
 
     config = runtime.config
-    client = WSClient(bot_id=config.aibot_bot_id, secret=config.aibot_secret)
-    client.on("message.text", make_handler(runtime, client, generate_req_id))
-    client.on("message.mixed", make_handler(runtime, client, generate_req_id))
-    client.on("authenticated", lambda: log.info("智能机器人长连接认证成功"))
-    client.on("disconnected", lambda reason: log.warning("智能机器人连接断开：%s", reason))
-    client.on("error", lambda exc: log.error("智能机器人连接错误：%s", exc))
-    await client.connect()
-    log.info("智能机器人长连接已建立（bot_id=%s）", config.aibot_bot_id)
-    try:
-        await runtime.stop.wait()
-    finally:
+    while not runtime.stop.is_set():
+        client = WSClient(bot_id=config.aibot_bot_id, secret=config.aibot_secret)
+        client.on("message.text", make_handler(runtime, client, generate_req_id))
+        client.on("message.mixed", make_handler(runtime, client, generate_req_id))
+        client.on("authenticated", lambda: log.info("智能机器人长连接认证成功"))
+        client.on("disconnected", lambda reason: log.warning("智能机器人连接断开：%s", reason))
+        client.on("error", lambda exc: log.error("智能机器人连接错误：%s", exc))
         try:
-            await client.disconnect()
-        except Exception:
-            pass
+            await client.connect()
+        except Exception as exc:
+            log.error("智能机器人连接失败（%s），30 秒后重试", exc)
+            try:
+                await asyncio.wait_for(runtime.stop.wait(), timeout=30.0)
+            except TimeoutError:
+                continue
+            break
+        log.info("智能机器人长连接已建立（bot_id=%s）", config.aibot_bot_id)
+        try:
+            await runtime.stop.wait()
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        break

@@ -9,13 +9,15 @@
 - 消息去重: (群名, 发送者, 内容, 时间) 有界键集合
 - 积压保护: 队列深度上限（满则丢最旧）；连续 N 次 RAG 失败进入熔断窗口，窗口内直接回复兜底文案
 - 失败文案读 WXBOT_FAILURE_TEXT（默认内置），不读容器写入的 gateway.db（消除宿主/容器 SQLite 并发）
-- wxautox4 为付费闭源 API: 单测以 fake 客户端注入；真机集成点集中在 _connect_wxauto
+- WXBOT_ENV_FILE 可指定最小化配置副本路径（默认 CWD 相对 .env）
+- wxautox4 为付费闭源 API: 单测以 fake 客户端注入；真机集成点集中在 connect()
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
@@ -27,10 +29,11 @@ from typing import Any
 
 from .aibot import compose_reply, query_rag
 from .config import DEFAULT_ENV_FILE, _merge, _split
+from .queue import DEFAULT_FAILURE_TEXT as _QUEUE_FAILURE_TEXT
 
 log = logging.getLogger(__name__)
 
-DEFAULT_FAILURE_TEXT = "抱歉，这条消息暂时没能处理，已经记录，稍后跟进。"
+DEFAULT_FAILURE_TEXT = _QUEUE_FAILURE_TEXT
 DEFAULT_MENTION_KEYWORD = "@智能小助手"
 
 # wxbridge 允许读取的环境变量白名单（最小化凭据面——宿主机进程不接触采集类密钥）
@@ -61,13 +64,9 @@ def load_wxbot_config(
     env_file: Path | None = None,
 ) -> WXBotConfig:
     """读取 WXBOT_*/RAG_* 白名单键；配置对象不携带任何其他环境变量。"""
-    environ = dict(environ) if environ is not None else None
-    if environ is None:
-        import os
-
-        environ = {k: v for k, v in os.environ.items() if k in _ALLOWED_ENV_KEYS}
-    env_file = env_file if env_file is not None else DEFAULT_ENV_FILE
-    merged = _merge(environ, env_file)
+    raw = dict(environ) if environ is not None else os.environ
+    env_file = env_file if env_file is not None else Path(raw.get("WXBOT_ENV_FILE") or DEFAULT_ENV_FILE)
+    merged = _merge({k: v for k, v in raw.items() if k in _ALLOWED_ENV_KEYS}, env_file)
     merged = {k: v for k, v in merged.items() if k in _ALLOWED_ENV_KEYS}
     return WXBotConfig(
         rag_api_url=merged.get("RAG_API_URL", ""),
@@ -91,20 +90,23 @@ class MessageTask:
 
 
 class Deduper:
-    """有界消息键集合；check 返回 True 表示首次出现。"""
+    """有界消息键集合。check 只查不登记；add 登记新键。入队成功后才 add（防丢失后重投被判重）。"""
 
     def __init__(self, max_keys: int = 512) -> None:
         self._max = max_keys
         self._seen: OrderedDict[tuple, None] = OrderedDict()
 
-    def check_and_add(self, key: tuple) -> bool:
+    def check(self, key: tuple) -> bool:
+        """True = 已见过（重复消息）。"""
         if key in self._seen:
             self._seen.move_to_end(key)
-            return False
+            return True
+        return False
+
+    def add(self, key: tuple) -> None:
         self._seen[key] = None
         while len(self._seen) > self._max:
             self._seen.popitem(last=False)
-        return True
 
 
 class CircuitBreaker:
@@ -169,23 +171,32 @@ class WxBridge:
         return any(k.strip().lower() in stripped.lower() for k in self.config.keywords if k.strip())
 
     def enqueue_message(self, chat: str, sender: str, content: str, ts: str = "") -> bool:
-        """callback 只调这个：匹配 → 去重 → 入队（满则丢最旧）。返回是否入队。"""
+        """callback 只调这个：匹配 → 去重检查 → 入队（满则丢最旧重试）→ 成功后登记键。返回是否入队。"""
         content = (content or "").strip()
         if not content or not self._matches(content):
             return False
-        if not self._dedupe.check_and_add((chat, sender, content, ts)):
+        key = (chat, sender, content, ts)
+        if self._dedupe.check(key):
             return False
         task = MessageTask(chat=chat, sender=sender, content=content)
-        try:
-            self._tasks.put_nowait(task)
-        except queue.Full:
+        enqueued = False
+        for _ in range(3):  # 满则丢最旧后重投；多 callback 并发下最多重试 3 次
             try:
-                dropped = self._tasks.get_nowait()
-                log.warning("队列已满，丢弃最旧任务（群=%s）", dropped.chat)
-            except queue.Empty:
-                pass
-            self._tasks.put_nowait(task)
-        return True
+                self._tasks.put_nowait(task)
+                enqueued = True
+                break
+            except queue.Full:
+                try:
+                    dropped = self._tasks.get_nowait()
+                    log.warning("队列已满，丢弃最旧任务（群=%s）", dropped.chat)
+                    self._dedupe.add((dropped.chat, dropped.sender, dropped.content, ""))  # 丢弃即允许其同内容重投
+                except queue.Empty:
+                    pass
+        if enqueued:
+            self._dedupe.add(key)
+            return True
+        log.warning("队列持续满载，消息未入队（群=%s）", chat)
+        return False
 
     # ---- 消费侧（worker 线程） ----
     def _rate_wait(self) -> None:

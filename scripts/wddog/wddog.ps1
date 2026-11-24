@@ -1,9 +1,10 @@
 ﻿# Docker 引擎看门狗（U4/KTD7）
 # 探活失败 → 恢复序列（停 Docker Desktop → wsl --shutdown → 重启）→ 轮询恢复
-# 恢复互斥: in-progress 标记文件 15 分钟宽限期（覆盖 Docker Desktop 冷启动），防「杀掉-重启-再杀掉」死循环
-# 连续 MAX_CONSECUTIVE_FAILURES 次恢复失败后只告警不再动手（防风暴）
+# 恢复互斥: in-progress 标记 15 分钟宽限期（覆盖 Docker Desktop 冷启动），防「杀掉-重启-再杀掉」死循环
+# 失败计数在恢复序列开始前递增（任何中断路径都已计数）；连续 MAX_CONSECUTIVE_FAILURES 次后只告警（防风暴）
+# 日志: C:\ProgramData\wecom-wddog\wddog.log（SYSTEM 与交互用户一致）
 #
-# 用法: powershell -ExecutionPolicy Bypass -File scripts\wddog\wddog.ps1
+# 用法: powershell -ExecutionPolicy Bypass -File <注册目录>\wddog.ps1
 # 注册计划任务: powershell -ExecutionPolicy Bypass -File scripts\wddog\register-task.ps1
 
 param(
@@ -13,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$logDir = Join-Path $env:LOCALAPPDATA "wecom-wddog"
+$logDir = "C:\ProgramData\wecom-wddog"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $logFile = Join-Path $logDir "wddog.log"
 $markerFile = Join-Path $logDir "recover_in_progress.marker"
@@ -39,6 +40,7 @@ if (-not $probe.WaitForExit($ProbeTimeoutSeconds * 1000)) {
 if ($healthy) {
     Log INFO "heartbeat ok"
     if (Test-Path $failCounterFile) { Remove-Item $failCounterFile -Force }
+    if (Test-Path $markerFile) { Remove-Item $markerFile -Force }
     exit 0
 }
 
@@ -49,16 +51,17 @@ if (Test-Path $markerFile) {
         Log INFO "恢复进行中（标记 {0:N0} 分钟前，宽限 {1} 分钟），本轮跳过" -f $markerAge.TotalMinutes, $GraceMinutes
         exit 0
     }
-    Log WARN "恢复标记已超宽限期（$($markerAge.TotalMinutes.ToString('N0')) 分钟），计入失败并重新恢复"
+    Log WARN "恢复标记已超宽限期（$($markerAge.TotalMinutes.ToString('N0')) 分钟），重新恢复"
 }
 
-# ---- 连续失败熔断（防风暴） ----
+# ---- 连续失败熔断（防风暴）——计数在动手前先递增，任何中断路径都已计入 ----
 $failCount = 0
 if (Test-Path $failCounterFile) { $failCount = [int](Get-Content $failCounterFile -Raw) }
 if ($failCount -ge $MaxConsecutiveFailures) {
     Log ERROR "已连续 $failCount 次恢复失败，停止自动恢复 — 请人工介入（查看 Docker Desktop / WSL）"
     exit 1
 }
+Set-Content -Path $failCounterFile -Value ($failCount + 1)
 
 # ---- 恢复序列（本会话已验证） ----
 Log WARN "引擎不健康，开始恢复（第 $($failCount + 1) 次）"
@@ -70,9 +73,9 @@ wsl --shutdown
 Start-Sleep -Seconds 5
 Start-Process $dockerExe
 
-# ---- 轮询恢复（最多 10 分钟） ----
+# ---- 轮询恢复（12 次 x 最长 40s = 8 分钟，确保在计划任务 ExecutionTimeLimit 20 分钟内完成） ----
 $restored = $false
-foreach ($i in 1..60) {
+foreach ($i in 1..12) {
     Start-Sleep -Seconds 10
     $p = Start-Process -FilePath "docker" -ArgumentList "info" -NoNewWindow -PassThru -RedirectStandardOutput "$logDir\probe.out" -RedirectStandardError "$logDir\probe.err"
     if ($p.WaitForExit(30000) -and $p.ExitCode -eq 0) { $restored = $true; break }
@@ -86,6 +89,5 @@ if ($restored) {
     exit 0
 }
 
-Log ERROR "恢复轮询超时（10 分钟）"
-Set-Content -Path $failCounterFile -Value ($failCount + 1)
+Log ERROR "恢复轮询超时（约 8 分钟），失败计数已累加；下一周期若仍失败将继续计满后转人工"
 exit 1

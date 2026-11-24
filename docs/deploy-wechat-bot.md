@@ -27,6 +27,8 @@ WXBOT_RATE_SECONDS=2
 WXBOT_QUEUE_MAX=10
 WXBOT_CIRCUIT_THRESHOLD=3
 WXBOT_CIRCUIT_COOLDOWN_SECONDS=60
+# 最小化配置副本路径（可选；默认读 CWD 相对 .env——常驻模式下建议显式指定）
+WXBOT_ENV_FILE=D:\secrets\wxbridge.env
 ```
 
 安全约束：宿主机 wxbridge 只读以上白名单键 + RAG_API_URL/TOKEN（代码强制过滤，见 `load_wxbot_config`）；完整 `.env`（含企微 Secret/私钥）仅存在于容器挂载目录，不要拷到宿主机日常环境。
@@ -44,9 +46,9 @@ WXBOT_CIRCUIT_COOLDOWN_SECONDS=60
 # 前台试水（先跑通）
 uv run python -m wecom_bot.wxbridge
 
-# 常驻（计划任务，开机自启）
-# 详见 scripts/wddog/register-task.ps1 同款方式注册，动作改为:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\wecom_bot\wxbridge_start.ps1
+# 常驻（计划任务，开机自启，崩溃 15 秒自动重启）
+powershell -ExecutionPolicy Bypass -File scripts\wddog\register-task.ps1 的同款方式注册，动作指向:
+powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\scripts\wxbridge_start.ps1
 ```
 
 - 停止：前台 Ctrl+C；计划任务 `Stop-ScheduledTask`

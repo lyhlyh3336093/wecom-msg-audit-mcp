@@ -1079,7 +1079,7 @@ button.mini { padding:4px 10px; font-size:12px; } button.mini.red { background:v
 const PAGE = 50;
 let curKey = null, curOffset = 0, curTotal = 0;
 const $ = id => document.getElementById(id);
-const esc = s => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
+const esc = s => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML.replace(/'/g, "&#39;").replace(/"/g, "&quot;"); };
 const fmtTime = t => t ? new Date(t).toLocaleString("zh-CN", {hour12:false}) : "-";
 
 function log(lines) { $("log").textContent = lines.join("\\n"); $("log").scrollTop = 0; }
