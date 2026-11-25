@@ -46,8 +46,9 @@ if (-not $sevenZip) {
 
 $images = @("wecom-msg-audit-mcp:latest", "aihub-knowledge-app:latest",
             "docker.m.daocloud.io/pgvector/pgvector:pg17", "redis:7-alpine",
-            "docker.m.daocloud.io/minio/minio:latest",
             "ghcr.io/huggingface/text-embeddings-inference:cpu-1.6")
+# 注: docker.m.daocloud.io/minio/minio:latest 本机各镜像源均拉取失败，未列入导出。
+# 新机器部署 aihub 前需自行拉取（compose 引用它），MinIO 卷数据已由 minio_data.tar 携带。
 $aihubStopped = $false
 $stopStamp = (Get-Date).ToString("o")
 $restartStamp = ""
@@ -56,12 +57,11 @@ try {
     # ---- ⓪ 停止写入方 ----
     if (-not $SkipStopContainers) {
         Step "⓪ 停止写入方容器（本项目全部 + aihub app；pg/minio 保持运行）"
-        docker compose stop 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Warning "本项目 compose stop 返回 $LASTEXITCODE（可能本就未运行，继续）" }
+        $wecomRunning = @(docker ps --format "{{.Names}}" | Where-Object { $_ -eq "wecom-msg-audit-mcp" }).Count -gt 0
+        if ($wecomRunning) { docker stop wecom-msg-audit-mcp 2>&1 | Out-Null }
         if (Test-Path $AihubComposePath) {
-            docker compose -f $AihubComposePath stop app 2>&1 | Out-Null
-            $script:aihubStopped = ($LASTEXITCODE -eq 0)
-            if (-not $aihubStopped) { Write-Warning "aihub app stop 返回 $LASTEXITCODE（可能本就未运行）" }
+            $appRunning = @(docker ps --format "{{.Names}}" | Where-Object { $_ -eq "aihub-knowledge-app" }).Count -gt 0
+            if ($appRunning) { docker stop aihub-knowledge-app 2>&1 | Out-Null; $script:aihubStopped = $true }
         }
     } else {
         Write-Warning "-SkipStopContainers: 容器持续写入，快照可能撕裂（仅限演练）"
@@ -90,6 +90,18 @@ try {
 
     # ---- ② 容器内 pg_dump（pg 容器保持运行，一致性快照） ----
     Step "② 导出知识库 Postgres（docker exec 运行中容器）"
+    $pgRunning = @(docker ps --format "{{.Names}}" | Where-Object { $_ -eq "aihub-knowledge-pg" }).Count -gt 0
+    if (-not $pgRunning) {
+        Write-Warning "pg 容器未运行 — 自动拉起并等待就绪"
+        docker start aihub-knowledge-pg | Out-Null
+        $pgReady = $false
+        foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            docker exec aihub-knowledge-pg pg_isready -U aihub -d aihub_knowledge *> $null
+            if ($LASTEXITCODE -eq 0) { $pgReady = $true; break }
+        }
+        if (-not $pgReady) { throw "pg 容器拉起后 60 秒仍未就绪" }
+    }
     docker exec aihub-knowledge-pg pg_dump -U aihub -d aihub_knowledge -F c -f /tmp/aihub_knowledge.dump
     if ($LASTEXITCODE -ne 0) { throw "pg_dump 失败（容器 aihub-knowledge-pg 未运行或凭据不符）" }
     docker cp aihub-knowledge-pg:/tmp/aihub_knowledge.dump (Join-Path $work "aihub_knowledge.dump")
@@ -104,17 +116,18 @@ try {
         Write-Warning "data/ 不存在，跳过（首次部署前迁移？）"
     }
 
-    Step "  导出 MinIO 卷（短暂停止 minio 容器保证一致性）"
-    docker stop aihub-knowledge-minio | Out-Null
-    docker volume inspect aihub-knowledge_minio_data *> $null
-    if ($LASTEXITCODE -ne 0) { throw "数据卷 aihub-knowledge_minio_data 不存在 — docker volume ls 核对卷名" }
-    docker run --rm --name aihub-mig-minio -v aihub-knowledge_minio_data:/data -v "${work}:/dump" --entrypoint sh `
-        docker.m.daocloud.io/minio/minio:latest -c "cd /data && tar cf /dump/minio_data.tar ."
+    Step "  导出 MinIO 卷（存在 minio 容器则短暂停止保证一致性）"
+    $minioRunning = @(docker ps --format "{{.Names}}" | Where-Object { $_ -eq "aihub-knowledge-minio" }).Count -gt 0
+    if ($minioRunning) { docker stop aihub-knowledge-minio | Out-Null }
+    docker volume inspect docker_minio_data *> $null
+    if ($LASTEXITCODE -ne 0) { throw "数据卷 docker_minio_data 不存在 — docker volume ls 核对卷名" }
+    docker run --rm --name aihub-mig-minio -v docker_minio_data:/data -v "${work}:/dump" --entrypoint sh `
+        docker.m.daocloud.io/pgvector/pgvector:pg17 -c "cd /data && tar cf /dump/minio_data.tar ."
     if ($LASTEXITCODE -ne 0) { throw "MinIO 卷导出失败" }
-    docker start aihub-knowledge-minio | Out-Null
+    if ($minioRunning) { docker start aihub-knowledge-minio | Out-Null }
 
-    foreach ($pair in @(@("aihub-knowledge_bge_m3_data", "bge_m3_data.tar"),
-                        @("aihub-knowledge_bge_reranker_data", "bge_reranker_data.tar"))) {
+    foreach ($pair in @(@("docker_bge_m3_data", "bge_m3_data.tar"),
+                        @("docker_bge_reranker_data", "bge_reranker_data.tar"))) {
         Step "  导出 BGE 模型卷 $($pair[0])（只读 tar）"
         docker volume inspect $pair[0] *> $null
         if ($LASTEXITCODE -ne 0) { throw "数据卷 $($pair[0]) 不存在 — docker volume ls 核对卷名" }
@@ -150,10 +163,8 @@ finally {
     # ---- 重启写入方（无论成败都执行） ----
     if (-not $SkipStopContainers) {
         Step "重启写入方容器"
-        docker compose start 2>&1 | Out-Null
-        if ($script:aihubStopped -and (Test-Path $AihubComposePath)) {
-            docker compose -f $AihubComposePath start app 2>&1 | Out-Null
-        }
+        docker start wecom-msg-audit-mcp 2>&1 | Out-Null
+        if ($script:aihubStopped) { docker start aihub-knowledge-app 2>&1 | Out-Null }
         $restartStamp = (Get-Date).ToString("o")
     }
 }

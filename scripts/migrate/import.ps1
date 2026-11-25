@@ -138,7 +138,7 @@ if (Test-Path (Join-Path $pack "aihub_knowledge.dump")) {
     if ($LASTEXITCODE -ne 0) { Die "pg_restore 失败 — 现场已保留（容器 aihub-mig-pg、卷 aihub-knowledge_pg_data），排查后 -Force 重跑" }
     docker rm -f aihub-mig-pg | Out-Null
 }
-foreach ($pair in @(@("minio_data.tar", "aihub-knowledge_minio_data", "docker.m.daocloud.io/minio/minio:latest"),
+foreach ($pair in @(@("minio_data.tar", "aihub-knowledge_minio_data", $pgTag),
                    @("bge_m3_data.tar", "aihub-knowledge_bge_m3_data", $pgTag),
                    @("bge_reranker_data.tar", "aihub-knowledge_bge_reranker_data", $pgTag))) {
     $tar = Join-Path $pack $pair[0]
@@ -191,7 +191,7 @@ Step "启动 aihub 全栈"
 Push-Location $aihubDir
 try {
     if ($Rehearsal) { docker compose -f docker/docker-compose.yml -f rehearsal-override.yml -p aihub-rehearsal up -d }
-    else { docker compose -f docker/docker-compose.yml up -d }
+    else { docker compose -f docker/docker-compose.yml -p aihub-knowledge up -d }  # -p 固定项目名，卷名与恢复的 aihub-knowledge_* 对齐
     if ($LASTEXITCODE -ne 0) { Die "aihub compose up 失败" }
 } finally { Pop-Location }
 

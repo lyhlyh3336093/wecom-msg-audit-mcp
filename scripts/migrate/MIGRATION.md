@@ -8,9 +8,11 @@
 1. 确认 Docker 引擎正常（`docker info`；若僵死按下文「Docker 引擎僵死恢复」处理）
 2. 执行导出：
    ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts\migrate\export.ps1 -OutputDir D:\migration_pack
+   powershell -ExecutionPolicy Bypass -File scripts\migrate\export.ps1 -OutputDir <可写目录>
    ```
-   - 脚本会停本项目与 aihub 容器 → 导出镜像/数据库/数据卷 → 重启容器 → 生成加密归档
+   - **本机限制**: IDE 文件保护只允许写工作区等白名单目录，`D:\migration_pack` 会报「拒绝访问」——用 `D:\WorkSpace\wecom-msg-audit-mcp\migration_pack`
+   - 7z 可用 `winget install 7zip.7zip`，或直接用仓库内便携版 `scripts\migrate\tools\7z.exe`（加入 PATH）
+   - 脚本会停本项目容器与 aihub app 容器（pg 容器未运行会自动拉起）→ 导出镜像/数据库/数据卷 → 重启容器 → 生成加密归档
    - **导出期间机器人短暂停机（约 5-15 分钟，取决于磁盘速度）**
 3. 记录解压密码 → 存入密码管理器
 4. 用移动硬盘/局域网把 `migration_pack.7z` 拷到新机器（明文 work 目录不要拷）
@@ -33,6 +35,7 @@ powershell -ExecutionPolicy Bypass -File scripts\migrate\import.ps1 -Pack D:\mig
 ```
 
 - 脚本自动完成：解压 → manifest 校验 → docker load → Postgres/MinIO/BGE 卷恢复 → KTD8 容器内 RAG 地址转换 → 启动 → health 与容器内 RAG 连通检查
+- **注意**: MinIO 镜像未随包携带（旧机器各镜像源拉取失败）。若 aihub compose up 因缺 `docker.m.daocloud.io/minio/minio:latest` 失败，先 `docker pull docker.m.daocloud.io/minio/minio:latest`（或可用镜像源）后重跑 import.ps1（`-Force`）
 - 演练（不打扰现有部署）: 加 `-Rehearsal`（override 剥离容器名、端口偏移 1xxxx）
 - 目标目录已存在时默认中止，确认覆盖加 `-Force`
 
