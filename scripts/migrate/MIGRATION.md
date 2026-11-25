@@ -22,7 +22,7 @@
 1. 安装 Docker Desktop（WSL2 后端），启动并确认 `docker info` 正常
 2. 安装 7-Zip（`winget install 7zip.7zip`）
 3. 安装 Python 3.12 + uv（供本项目 `uv run` 使用）
-4. 拷贝本仓库到新机器（`git clone` 或拷贝目录）
+4. 拷贝本仓库到新机器（`git clone git@github.com:lyhlyh3336093/wecom-msg-audit-mcp.git`，aihub 代码为 `git clone git@github.com:lyhlyh3336093/aihub-knowledge.git`；需先在新机器配置 GitHub SSH key）
 5. PC 微信：登录**专用小号**，关闭微信自动更新；确认群聊窗口可打开
 6. wxautox4：按官方流程激活（一机一码；换绑政策购买时已确认）
 7. Windows 自动登录 + 禁止锁屏：`netplwiz` 取消勾选「要求用户输入用户名和密码」；设置 → 电源 → 屏幕永不关闭睡眠（显示器可熄屏）；组策略或注册表禁用锁屏（`HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization` → `NoLockScreen=1`）
